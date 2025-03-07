@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score
+import tensorflow as tf
+from tensorflow.keras import layers, models, Model, backend as K
+
+file_path = "C:/Data/Final.xlsx"
+xls = pd.ExcelFile(file_path)
+df = pd.read_excel(xls, sheet_name="Sheet1")
+
+column_name = "Treatment outcome of TB patients notified (Death Rate)"
+if column_name not in df.columns:
+    raise ValueError(f"Column '{column_name}' not found in file.")
+
+df[column_name] = df[column_name].fillna(df[column_name].median())
+
+scaler = MinMaxScaler()
+df[column_name] = scaler.fit_transform(df[[column_name]].values.reshape(-1, 1))
+
+if "is_anomaly" in df.columns:
+    true_labels = df["is_anomaly"].values
+else:
+    anomaly_threshold = np.percentile(df[column_name], 80)
+    df["is_anomaly"] = (df[column_name] > anomaly_threshold).astype(int)
+    true_labels = df["is_anomaly"].values
+
+train_data, test_data, train_labels, test_labels = train_test_split(
+    df[column_name], true_labels, test_size=0.2, random_state=42
+)
+train_data = np.array(train_data).reshape(-1, 1)
+test_data = np.array(test_data).reshape(-1, 1)
+
+original_dim = (1,)
+intermediate_dim = 64
+latent_dim = 8
+
+
+inputs = layers.Input(shape=original_dim)
+x = layers.Dense(intermediate_dim, activation='relu', kernel_regularizer=tf.keras.regularizers.l1(0.01))(inputs)
+z_mean = layers.Dense(latent_dim)(x)
+z_log_var = layers.Dense(latent_dim)(x)
+
+def sampling(args):
+    z_mean, z_log_var = args
+    epsilon = K.random_normal(shape=(K.shape(z_mean)[0], latent_dim), mean=0., stddev=1.0)
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+z = layers.Lambda(sampling)([z_mean, z_log_var])
+encoder = models.Model(inputs, [z_mean, z_log_var, z], name="encoder")
+
+decoder_input = layers.Input(shape=(latent_dim,))
+x = layers.Dense(intermediate_dim, activation='relu', kernel_regularizer=tf.keras.regularizers.l1(0.01))(decoder_input)
+outputs = layers.Dense(original_dim[0])(x)
+decoder = models.Model(decoder_input, outputs, name="decoder")
+
+class VAE(Model):
+    def __init__(self, encoder, decoder, **kwargs):
+        super(VAE, self).__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def call(self, x):
+        z_mean, z_log_var, z = self.encoder(x)
+        kl_loss = -0.5 * K.sum(1 + z_log_var - K.square(z_mean) - K.exp(z_log_var), axis=-1)
+        self.add_loss(K.mean(kl_loss))
+        reconstruction = self.decoder(z)
+        return reconstruction
+
+vae = VAE(encoder, decoder)
+
+vae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss=tf.keras.losses.MeanSquaredError())
+history = vae.fit(train_data, train_data, epochs=50, batch_size=32, validation_data=(test_data, test_data))
+
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.show()
+
+reconstructed_data = vae.predict(test_data)
+
+reconstruction_error = np.sqrt(np.mean(np.square(test_data - reconstructed_data), axis=1))
+
+threshold = np.percentile(reconstruction_error, 90)
+predicted_anomalies = reconstruction_error > threshold
+
+plt.figure(figsize=(8, 5))
+plt.hist(reconstruction_error, bins=50, edgecolor='black', alpha=0.7)
+plt.axvline(threshold, color='red', linestyle='dashed', linewidth=2, label='Threshold')
+plt.xlabel('Reconstruction Error')
+plt.ylabel('Frequency')
+plt.title('Reconstruction Error Distribution')
+plt.legend()
+plt.show()
+
+precision = precision_score(test_labels, predicted_anomalies)
+recall = recall_score(test_labels, predicted_anomalies)
+
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+
+
+# anomaly_indices = np.where(predicted_anomalies)[0]
+# anomalous_values = scaler.inverse_transform(test_data[anomaly_indices].reshape(-1, 1))
+#
+# print("Anomaly indices:", anomaly_indices)
+# print("Abnormal (original):", anomalous_values.flatten())
