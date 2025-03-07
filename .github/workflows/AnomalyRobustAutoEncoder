@@ -1,0 +1,85 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+
+file_path = "C:/Data/Final.xlsx"
+xls = pd.ExcelFile(file_path)
+df = pd.read_excel(xls, sheet_name="Sheet1")
+
+column_name = "Treatment outcome of TB patients notified (Death Rate)"
+
+df[column_name] = df[column_name].fillna(df[column_name].median())
+
+Q1 = df[column_name].quantile(0.25)
+Q3 = df[column_name].quantile(0.75)
+IQR = Q3 - Q1
+lower_bound = Q1 - 1.5 * IQR
+upper_bound = Q3 + 1.5 * IQR
+df["Anomaly_Label"] = ((df[column_name] < lower_bound) | (df[column_name] > upper_bound)).astype(int)
+
+scaler = MinMaxScaler()
+df["Normalized"] = scaler.fit_transform(df[[column_name]])
+
+train_data, test_data, y_train, y_test = train_test_split(
+    df["Normalized"], df["Anomaly_Label"], test_size=0.1, random_state=42
+)
+train_data = np.array(train_data).reshape(-1, 1)
+test_data = np.array(test_data).reshape(-1, 1)
+
+original_dim = (1,)
+intermediate_dim = 64
+latent_dim = 2
+
+inputs = layers.Input(shape=original_dim)
+x = layers.Dense(intermediate_dim, activation='relu',
+                 activity_regularizer=regularizers.l1(1e-5))(inputs)
+encoded = layers.Dense(latent_dim, activation='relu')(x)
+x = layers.Dense(intermediate_dim, activation='relu')(encoded)
+decoded = layers.Dense(original_dim[0])(x)
+
+autoencoder = models.Model(inputs, decoded)
+autoencoder.compile(optimizer='adam', loss=tf.keras.losses.Huber())
+
+history = autoencoder.fit(train_data, train_data, epochs=150, batch_size=32, validation_data=(test_data, test_data), verbose=1)
+
+plt.figure(figsize=(8, 5))
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.show()
+
+reconstructed_data = autoencoder.predict(test_data)
+reconstruction_error = np.mean((test_data - reconstructed_data) ** 2, axis=1)
+
+threshold = np.percentile(reconstruction_error, 90)
+y_pred = (reconstruction_error > threshold).astype(int)
+
+plt.figure(figsize=(8, 5))
+plt.hist(reconstruction_error, bins=50, edgecolor='black', alpha=0.7)
+plt.axvline(threshold, color='red', linestyle='dashed', linewidth=2, label='Threshold')
+plt.xlabel('Reconstruction Error')
+plt.ylabel('Frequency')
+plt.title('Reconstruction Error Distribution')
+plt.legend()
+plt.show()
+
+precision = precision_score(y_test, y_pred, zero_division=0)
+recall = recall_score(y_test, y_pred, zero_division=0)
+
+
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+
+# anomaly_indices = np.where(y_pred == 1)[0]
+# anomalous_values = scaler.inverse_transform(test_data[anomaly_indices].reshape(-1, 1))
+# print("Abnormal values (original):", anomalous_values.flatten())
