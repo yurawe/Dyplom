@@ -1,1 +1,1154 @@
+import pandas as pd
+import numpy as np
+import matplotlib
 
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV, \
+    RandomizedSearchCV
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, \
+    make_scorer, average_precision_score, matthews_corrcoef
+from sklearn.decomposition import PCA
+import tensorflow as tf
+from tensorflow.keras import layers, models, Model, regularizers, callbacks
+import seaborn as sns
+import warnings
+import time
+import pickle
+from scipy.stats import rankdata
+
+from sklearn.ensemble import IsolationForest
+from sklearn.covariance import EllipticEnvelope
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.linear_model import LogisticRegression
+import lightgbm as lgb
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+tf.random.set_seed(42)
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+
+SCRIPT_VERSION = "v5.9 (HyperOpt Sklearn & Enhanced Stacking + New Metrics)"
+print(f"Improved Anomaly Detection for TB Data - {SCRIPT_VERSION}\n")
+
+N_ITER_RANDOM_SEARCH_SKLEARN = 20
+CV_SKLEARN = 3
+
+feature_columns = [
+    "Treatment outcome of TB patients notified (Death Rate)",
+    "Treatment outcome of TB patients notified (Success Rate)",
+    "TB Cases Notified Female", "TB Cases Notified Male",
+    "TB case notification rate (Total)",
+    "TB patients with known Alcohol usage status (%) (Total)",
+    "TB patients with known Tobacco usage status (%) (Total)",
+    "TB-HIV co-infected patients Diagnosed",
+    "Paediatric TB patients notified (Total)"
+]
+
+
+def prepare_data(df_local):
+    for column in feature_columns:
+        if column in df_local.columns:
+            df_local[column] = df_local[column].fillna(df_local[column].median())
+
+    death_rate_col = "Treatment outcome of TB patients notified (Death Rate)"
+    actual_features_for_scaling = []
+
+    if death_rate_col not in df_local.columns:
+        df_local["Anomaly_Label"] = np.random.randint(0, 2, size=len(df_local))
+        potential_features = [col for col in feature_columns if col in df_local.columns and col != death_rate_col]
+        if potential_features:
+            actual_features_for_scaling = potential_features
+            normalized_data_local = StandardScaler().fit_transform(df_local[actual_features_for_scaling])
+        else:
+            num_cols_to_normalize = len(feature_columns) if feature_columns else 1
+            if num_cols_to_normalize == 0: num_cols_to_normalize = 1
+            normalized_data_local = StandardScaler().fit_transform(
+                np.random.rand(len(df_local), num_cols_to_normalize))
+            actual_features_for_scaling = [f"Random_F{i}" for i in range(num_cols_to_normalize)]
+        return normalized_data_local, df_local["Anomaly_Label"].values, StandardScaler(), actual_features_for_scaling
+
+    Q1 = df_local[death_rate_col].quantile(0.25)
+    Q3 = df_local[death_rate_col].quantile(0.75)
+    IQR = Q3 - Q1
+    iqr_factor = 1.75
+    lower_bound = Q1 - iqr_factor * IQR
+    upper_bound = Q3 + iqr_factor * IQR
+    df_local["Anomaly_IQR"] = (
+            (df_local[death_rate_col] < lower_bound) | (df_local[death_rate_col] > upper_bound)).astype(int)
+
+    z_threshold = 2.5
+    mean_val = df_local[death_rate_col].mean()
+    std_val = df_local[death_rate_col].std()
+    df_local["Anomaly_Z"] = ((df_local[death_rate_col] - mean_val).abs() > z_threshold * std_val).astype(
+        int) if std_val > 0 else 0
+
+    percentile_low = 0.05
+    percentile_high = 0.95
+    df_local["Anomaly_Percentile"] = ((df_local[death_rate_col] < df_local[death_rate_col].quantile(percentile_low)) | \
+                                      (df_local[death_rate_col] > df_local[death_rate_col].quantile(
+                                          percentile_high))).astype(int)
+
+    df_local["Anomaly_Label"] = (
+            (df_local["Anomaly_IQR"] | df_local["Anomaly_Z"] | df_local["Anomaly_Percentile"]) > 0).astype(int)
+
+    print(f"Data distribution for {death_rate_col}:\n{df_local[death_rate_col].describe()}")
+    print(f"IQR-based anomalies (factor {iqr_factor}): {df_local['Anomaly_IQR'].sum()}")
+    print(f"Z-score-based anomalies (threshold {z_threshold}): {df_local['Anomaly_Z'].sum()}")
+    print(
+        f"Percentile-based anomalies ({percentile_low * 100:.0f}-{percentile_high * 100:.0f}%): {df_local['Anomaly_Percentile'].sum()}")
+    print(
+        f"Combined anomalies defined: {df_local['Anomaly_Label'].sum()} ({(df_local['Anomaly_Label'].sum() / len(df_local)) * 100:.2f}%)")
+
+    actual_features_for_scaling = [col for col in feature_columns if col in df_local.columns]
+
+    if not actual_features_for_scaling:
+        num_cols_fallback = 1
+        normalized_data_local = StandardScaler().fit_transform(np.random.rand(len(df_local), num_cols_fallback))
+        actual_features_for_scaling = [f"Fallback_Random_F{i}" for i in range(num_cols_fallback)]
+        return normalized_data_local, df_local["Anomaly_Label"].values, StandardScaler(), actual_features_for_scaling
+
+    print(f"Features used for scaling: {actual_features_for_scaling}")
+    scaler_local = StandardScaler()
+    normalized_data_local = scaler_local.fit_transform(df_local[actual_features_for_scaling])
+    return normalized_data_local, df_local["Anomaly_Label"].values, scaler_local, actual_features_for_scaling
+
+
+def evaluate_score_ensemble(scores, y_true, model_name, results_summary_dict,
+                            balance_priority='f1'):
+    if scores is None or len(scores) != len(y_true) or np.all(np.isnan(scores)):
+        results_summary_dict[model_name] = {
+            "precision": np.nan, "recall": np.nan, "f1": np.nan, "threshold": np.nan,
+            "roc_auc": np.nan, "pr_auc": np.nan, "mcc": np.nan
+        }
+        return
+
+    valid_scores_indices = ~np.isnan(scores)
+    valid_scores = scores[valid_scores_indices]
+    valid_y_true = y_true[valid_scores_indices]
+
+    if len(valid_scores) == 0 or len(np.unique(valid_y_true)) < 2:
+        results_summary_dict[model_name] = {
+            "precision": np.nan, "recall": np.nan, "f1": np.nan, "threshold": np.nan,
+            "roc_auc": np.nan, "pr_auc": np.nan, "mcc": np.nan
+        }
+        return
+
+    thresholds = np.unique(np.sort(valid_scores))
+    if len(thresholds) > 200:
+        thresholds = np.unique(np.percentile(valid_scores, np.linspace(0, 100, 200)))
+    if len(thresholds) == 0: thresholds = np.array([0.5])
+
+    best_f1 = -1;
+    best_precision = -1;
+    best_recall = -1;
+    best_threshold = thresholds[0]
+
+    for th_val in thresholds:
+        pred_labels = (valid_scores > th_val).astype(int)
+        p = precision_score(valid_y_true, pred_labels, zero_division=0)
+        r = recall_score(valid_y_true, pred_labels, zero_division=0)
+        f1 = f1_score(valid_y_true, pred_labels, zero_division=0)
+
+        update_best = False
+        if balance_priority == 'recall':
+            if r > best_recall or (r == best_recall and f1 > best_f1): update_best = True
+        elif balance_priority == 'precision':
+            if p > best_precision or (p == best_precision and f1 > best_f1): update_best = True
+        elif f1 > best_f1:
+            update_best = True
+        elif f1 == best_f1:
+            if balance_priority == 'precision_focused_f1' and \
+                    (p > best_precision or (p == best_precision and r > best_recall)):
+                update_best = True
+            elif balance_priority == 'recall_focused_f1' and \
+                    (r > best_recall or (r == best_recall and p > best_precision)):
+                update_best = True
+        if update_best:
+            best_f1 = f1;
+            best_precision = p;
+            best_recall = r;
+            best_threshold = th_val
+
+    final_pred_labels_on_valid = (valid_scores > best_threshold).astype(int)
+    final_p = precision_score(valid_y_true, final_pred_labels_on_valid, zero_division=0)
+    final_r = recall_score(valid_y_true, final_pred_labels_on_valid, zero_division=0)
+    final_f1 = f1_score(valid_y_true, final_pred_labels_on_valid, zero_division=0)
+
+    roc_auc_val = roc_auc_score(valid_y_true, valid_scores) if len(np.unique(valid_y_true)) > 1 else np.nan
+    pr_auc_val = average_precision_score(valid_y_true, valid_scores) if len(np.unique(valid_y_true)) > 1 else np.nan
+    mcc_val = matthews_corrcoef(valid_y_true, final_pred_labels_on_valid)
+
+    print(
+        f"{model_name}: BestTh={best_threshold:.4f}, P={final_p:.4f}, R={final_r:.4f}, F1={final_f1:.4f}, "
+        f"ROC-AUC={roc_auc_val:.4f}, PR-AUC={pr_auc_val:.4f}, MCC={mcc_val:.4f} (Priority: {balance_priority})"
+    )
+    results_summary_dict[model_name] = {
+        "precision": final_p, "recall": final_r, "f1": final_f1, "threshold": best_threshold,
+        "roc_auc": roc_auc_val, "pr_auc": pr_auc_val, "mcc": mcc_val
+    }
+
+
+np.random.seed(42)
+n_samples = 500;
+synthetic_data = {}
+base_death_rate_clean = np.random.normal(7, 2, n_samples)
+Q1_dr_clean, Q3_dr_clean = np.quantile(base_death_rate_clean, 0.25), np.quantile(base_death_rate_clean, 0.75)
+IQR_dr_clean = Q3_dr_clean - Q1_dr_clean
+base_death_rate = base_death_rate_clean.copy()
+base_success_rate = np.clip(100 - base_death_rate - np.random.normal(5, 1.5, n_samples), 0, 100)
+synthetic_data[feature_columns[0]] = base_death_rate
+synthetic_data[feature_columns[1]] = base_success_rate
+for i in range(2, len(feature_columns)):
+    col_name = feature_columns[i]
+    if "Female" in col_name or "Male" in col_name or "Paediatric" in col_name:
+        synthetic_data[col_name] = np.random.normal(500 + i * 50, 100, n_samples) + base_death_rate * np.random.uniform(
+            5, 15)
+    elif "rate" in col_name:
+        synthetic_data[col_name] = np.random.normal(30 + i * 5, 10, n_samples) + base_death_rate * np.random.uniform(1,
+                                                                                                                     3)
+    else:
+        synthetic_data[col_name] = np.random.normal(60 - i * 2, 15, n_samples) - base_death_rate * np.random.uniform(
+            0.1, 0.5) + np.random.normal(0, 5, n_samples)
+anomaly_percentage = 0.10
+anomaly_indices = np.random.choice(range(n_samples), size=int(n_samples * anomaly_percentage), replace=False)
+for idx in anomaly_indices:
+    if np.random.rand() > 0.5:
+        synthetic_data[feature_columns[0]][idx] = np.random.uniform(Q3_dr_clean + 1.0 * IQR_dr_clean,
+                                                                    Q3_dr_clean + 2.5 * IQR_dr_clean)
+    else:
+        synthetic_data[feature_columns[0]][idx] = np.random.uniform(max(0, Q1_dr_clean - 2.5 * IQR_dr_clean),
+                                                                    Q1_dr_clean - 1.0 * IQR_dr_clean)
+    current_death_rate_anomaly = synthetic_data[feature_columns[0]][idx]
+    synthetic_data[feature_columns[1]][idx] = np.clip(100 - current_death_rate_anomaly - np.random.normal(10, 3), 0,
+                                                      100)
+    hiv_col_name = "TB-HIV co-infected patients Diagnosed"
+    if hiv_col_name in feature_columns: synthetic_data[hiv_col_name][idx] *= np.random.uniform(1.5,
+                                                                                               3.0) if current_death_rate_anomaly > np.median(
+        base_death_rate_clean) else np.random.uniform(0.3, 0.7)
+    alcohol_col_name = "TB patients with known Alcohol usage status (%) (Total)"
+    if alcohol_col_name in feature_columns: synthetic_data[alcohol_col_name][idx] = np.clip(
+        synthetic_data[alcohol_col_name][idx] * np.random.uniform(1.2, 1.8), 0, 100)
+df = pd.DataFrame(synthetic_data).clip(lower=0)
+
+normalized_data, anomaly_labels, scaler, list_of_scaled_feature_names = prepare_data(df.copy())
+X_train_orig_scaled, X_test_orig_scaled, y_train, y_test = train_test_split(normalized_data, anomaly_labels,
+                                                                            test_size=0.25, random_state=42,
+                                                                            stratify=anomaly_labels)
+
+if len(X_train_orig_scaled) == 0 or len(X_test_orig_scaled) == 0: raise ValueError("Training or testing set is empty.")
+print(f"\nTrain shape: {X_train_orig_scaled.shape}, Test shape: {X_test_orig_scaled.shape}")
+print(
+    f"Anomalies in train: {np.sum(y_train)} ({np.sum(y_train) / len(y_train) * 100:.2f}%), test: {np.sum(y_test)} ({np.sum(y_test) / len(y_test) * 100:.2f}%)")
+print(f"Actual features scaled: {list_of_scaled_feature_names}")
+
+
+def create_autoencoder(input_dim_ae):
+    encoding_dim = max(2, int(input_dim_ae / 3))
+    l1_size = max(8, int(input_dim_ae / 2))
+    inputs = layers.Input(shape=(input_dim_ae,))
+    x = layers.Dense(l1_size, activation='relu')(inputs)
+    x = layers.BatchNormalization()(x);
+    x = layers.Dropout(0.1)(x)
+    encoded = layers.Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1_l2(l1=1e-6, l2=1e-6))(
+        x)
+    x = layers.Dense(l1_size, activation='relu')(encoded)
+    x = layers.BatchNormalization()(x);
+    x = layers.Dropout(0.1)(x)
+    decoded = layers.Dense(input_dim_ae, activation='linear')(x)
+    autoencoder_model = models.Model(inputs, decoded)
+    autoencoder_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mean_absolute_error')
+    return autoencoder_model
+
+
+input_dim = X_train_orig_scaled.shape[1] if X_train_orig_scaled.shape[1] > 0 else 1
+autoencoder = create_autoencoder(input_dim)
+early_stop_ae = callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=0)
+ae_train_start_time = time.time()
+history_ae = autoencoder.fit(X_train_orig_scaled, X_train_orig_scaled, epochs=100, batch_size=32, validation_split=0.15,
+                             callbacks=[early_stop_ae], verbose=0)
+ae_train_time = time.time() - ae_train_start_time
+ae_predict_start_time = time.time()
+ae_reconstructed_test = autoencoder.predict(X_test_orig_scaled, verbose=0)
+ae_predict_time = time.time() - ae_predict_start_time
+ae_scores_train = np.mean(np.abs(X_train_orig_scaled - autoencoder.predict(X_train_orig_scaled, verbose=0)), axis=1)
+ae_scores_test = np.mean(np.abs(X_test_orig_scaled - ae_reconstructed_test), axis=1)
+
+thresholds_ae_train = np.unique(np.sort(ae_scores_train))
+if len(thresholds_ae_train) > 100: thresholds_ae_train = np.percentile(ae_scores_train, np.linspace(0, 100, 100))
+if len(thresholds_ae_train) == 0: thresholds_ae_train = np.array(
+    [np.median(ae_scores_train) if len(ae_scores_train) > 0 else 0.0])
+best_f1_ae_train_val = 0;
+best_threshold_ae = thresholds_ae_train[0] if len(thresholds_ae_train) > 0 else 0.0
+for th in thresholds_ae_train:
+    f1_val_train = f1_score(y_train, (ae_scores_train > th).astype(int), zero_division=0)
+    if f1_val_train > best_f1_ae_train_val: best_f1_ae_train_val = f1_val_train; best_threshold_ae = th
+ae_y_pred = (ae_scores_test > best_threshold_ae).astype(int)
+ae_precision = precision_score(y_test, ae_y_pred, zero_division=0)
+ae_recall = recall_score(y_test, ae_y_pred, zero_division=0)
+ae_f1 = f1_score(y_test, ae_y_pred, zero_division=0)
+ae_roc_auc = roc_auc_score(y_test, ae_scores_test) if len(np.unique(y_test)) > 1 and not np.all(
+    np.isnan(ae_scores_test)) else np.nan
+ae_pr_auc = average_precision_score(y_test, ae_scores_test) if len(np.unique(y_test)) > 1 and not np.all(
+    np.isnan(ae_scores_test)) else np.nan
+ae_mcc = matthews_corrcoef(y_test, ae_y_pred)
+
+print(
+    f"AE Results: BestTrainTh={best_threshold_ae:.4f}, Test P={ae_precision:.4f}, R={ae_recall:.4f}, F1={ae_f1:.4f}, ROC-AUC={ae_roc_auc:.4f}, PR-AUC={ae_pr_auc:.4f}, MCC={ae_mcc:.4f}")
+
+
+class ImprovedVAE(Model):
+    def __init__(self, encoder_vae_arg, decoder_vae_arg, beta=1.0, reconstruction_loss_fn='mse', **kwargs):
+        super(ImprovedVAE, self).__init__(**kwargs)
+        self.encoder_vae = encoder_vae_arg;
+        self.decoder_vae = decoder_vae_arg;
+        self.beta = beta
+        self.reconstruction_loss_computer = tf.keras.losses.MeanSquaredError() if reconstruction_loss_fn == 'mse' else tf.keras.losses.MeanAbsoluteError()
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(name="reconstruction_loss")
+        self.kl_loss_tracker = tf.keras.metrics.Mean(name="kl_loss")
+
+    @property
+    def metrics(self): return [self.total_loss_tracker, self.reconstruction_loss_tracker, self.kl_loss_tracker]
+
+    def train_step(self, data_arg):
+        data_input = data_arg[0] if isinstance(data_arg, tuple) else data_arg
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder_vae(data_input)
+            reconstruction = self.decoder_vae(z)
+            reconstruction_loss = self.reconstruction_loss_computer(data_input, reconstruction)
+            kl_loss = -0.5 * tf.reduce_mean(
+                tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1))
+            total_loss = reconstruction_loss + self.beta * kl_loss
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        self.total_loss_tracker.update_state(total_loss);
+        self.reconstruction_loss_tracker.update_state(reconstruction_loss);
+        self.kl_loss_tracker.update_state(kl_loss)
+        return {"loss": self.total_loss_tracker.result(),
+                "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+                "kl_loss": self.kl_loss_tracker.result()}
+
+    def call(self, inputs): z_mean, z_log_var, z = self.encoder_vae(inputs); return self.decoder_vae(z)
+
+
+def create_vae(input_dim_vae, beta_val=0.1, recon_loss='mse'):
+    latent_dim = max(2, int(input_dim_vae / 3));
+    l1_size = max(8, int(input_dim_vae / 2))
+    encoder_inputs = layers.Input(shape=(input_dim_vae,));
+    x = layers.Dense(l1_size, activation='relu')(encoder_inputs);
+    x = layers.BatchNormalization()(x);
+    x = layers.Dropout(0.1)(x)
+    z_mean = layers.Dense(latent_dim, name="z_mean")(x);
+    z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
+
+    def sampling(args): z_m, z_lv = args; b = tf.shape(z_m)[0]; d = tf.shape(z_m)[1]; eps = tf.random.normal(
+        shape=(b, d), seed=42); return z_m + tf.exp(0.5 * z_lv) * eps
+
+    z = layers.Lambda(sampling, name="z_sampling_lambda")([z_mean, z_log_var])
+    encoder_v = Model(encoder_inputs, [z_mean, z_log_var, z], name="encoder_v")
+    decoder_latent_inputs = layers.Input(shape=(latent_dim,));
+    x = layers.Dense(l1_size, activation='relu')(decoder_latent_inputs);
+    x = layers.BatchNormalization()(x);
+    x = layers.Dropout(0.1)(x)
+    decoder_outputs = layers.Dense(input_dim_vae, activation='linear')(x)
+    decoder_v = Model(decoder_latent_inputs, decoder_outputs, name="decoder_v")
+    vae_model = ImprovedVAE(encoder_v, decoder_v, beta=beta_val, reconstruction_loss_fn=recon_loss)
+    compile_loss_fn = tf.keras.losses.MeanSquaredError() if recon_loss == 'mse' else tf.keras.losses.MeanAbsoluteError()
+    vae_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss=compile_loss_fn)
+    return vae_model
+
+
+vae_recon_loss_type = 'mse'
+vae = create_vae(input_dim, beta_val=0.1, recon_loss=vae_recon_loss_type)
+early_stop_vae = callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, mode='min',
+                                         verbose=0)
+vae_train_start_time = time.time()
+vae_history = vae.fit(X_train_orig_scaled, X_train_orig_scaled, epochs=100, batch_size=32, validation_split=0.15,
+                      callbacks=[early_stop_vae], verbose=0)
+vae_train_time = time.time() - vae_train_start_time
+vae_predict_start_time = time.time()
+vae_reconstructed_test = vae.predict(X_test_orig_scaled, verbose=0)
+vae_predict_time = time.time() - vae_predict_start_time
+
+if vae_recon_loss_type == 'mse':
+    vae_scores_train = np.mean(np.square(X_train_orig_scaled - vae.predict(X_train_orig_scaled, verbose=0)), axis=1)
+    vae_scores_test = np.mean(np.square(X_test_orig_scaled - vae_reconstructed_test), axis=1)
+else:
+    vae_scores_train = np.mean(np.abs(X_train_orig_scaled - vae.predict(X_train_orig_scaled, verbose=0)), axis=1)
+    vae_scores_test = np.mean(np.abs(X_test_orig_scaled - vae_reconstructed_test), axis=1)
+
+thresholds_vae_train = np.unique(np.sort(vae_scores_train))
+if len(thresholds_vae_train) > 100: thresholds_vae_train = np.percentile(vae_scores_train, np.linspace(0, 100, 100))
+if len(thresholds_vae_train) == 0: thresholds_vae_train = np.array(
+    [np.median(vae_scores_train) if len(vae_scores_train) > 0 else 0.0])
+best_f1_vae_train_val = 0;
+best_threshold_vae = thresholds_vae_train[0] if len(thresholds_vae_train) > 0 else 0.0
+for th in thresholds_vae_train:
+    f1_val_train = f1_score(y_train, (vae_scores_train > th).astype(int), zero_division=0)
+    if f1_val_train > best_f1_vae_train_val: best_f1_vae_train_val = f1_val_train; best_threshold_vae = th
+vae_y_pred = (vae_scores_test > best_threshold_vae).astype(int)
+vae_precision = precision_score(y_test, vae_y_pred, zero_division=0);
+vae_recall = recall_score(y_test, vae_y_pred, zero_division=0);
+vae_f1 = f1_score(y_test, vae_y_pred, zero_division=0)
+vae_roc_auc = roc_auc_score(y_test, vae_scores_test) if len(np.unique(y_test)) > 1 and not np.all(
+    np.isnan(vae_scores_test)) else np.nan
+vae_pr_auc = average_precision_score(y_test, vae_scores_test) if len(np.unique(y_test)) > 1 and not np.all(
+    np.isnan(vae_scores_test)) else np.nan
+vae_mcc = matthews_corrcoef(y_test, vae_y_pred)
+
+print(
+    f"VAE Results: BestTrainTh={best_threshold_vae:.4f}, Test P={vae_precision:.4f}, R={vae_recall:.4f}, F1={vae_f1:.4f}, ROC-AUC={vae_roc_auc:.4f}, PR-AUC={vae_pr_auc:.4f}, MCC={vae_mcc:.4f}")
+
+all_predictions_test = {'ground_truth': y_test};
+all_scores_test = {};
+all_scores_train = {};
+results_summary = {}
+if ae_f1 >= 0:
+    all_predictions_test['Autoencoder'] = ae_y_pred;
+    all_scores_test['Autoencoder'] = ae_scores_test;
+    all_scores_train['Autoencoder'] = ae_scores_train
+    results_summary["Autoencoder"] = {"precision": ae_precision, "recall": ae_recall, "f1": ae_f1,
+                                      "roc_auc": ae_roc_auc, "pr_auc": ae_pr_auc, "mcc": ae_mcc,
+                                      "train_time": ae_train_time, "predict_time": ae_predict_time,
+                                      "threshold": best_threshold_ae, "train_f1_with_opt_thresh": best_f1_ae_train_val}
+if vae_f1 >= 0:
+    all_predictions_test['VAE'] = vae_y_pred;
+    all_scores_test['VAE'] = vae_scores_test;
+    all_scores_train['VAE'] = vae_scores_train
+    results_summary["VAE"] = {"precision": vae_precision, "recall": vae_recall, "f1": vae_f1, "roc_auc": vae_roc_auc,
+                              "pr_auc": vae_pr_auc, "mcc": vae_mcc,
+                              "train_time": vae_train_time, "predict_time": vae_predict_time,
+                              "threshold": best_threshold_vae, "train_f1_with_opt_thresh": best_f1_vae_train_val}
+
+MIN_F1_FOR_ENSEMBLE_INCLUSION = 0.15
+contamination_rate = np.sum(y_train == 1) / len(y_train) if len(y_train) > 0 and np.sum(y_train == 1) > 0 else 0.05
+if not (0 < contamination_rate < 0.5): contamination_rate = max(0.01, min(0.49, contamination_rate))
+
+sklearn_models_to_tune = {
+    "Isolation Forest": {"estimator": IsolationForest(random_state=42),
+                         "params": {'n_estimators': [50, 100, 200, 300], 'max_samples': [0.7, 0.9, 1.0, 'auto'],
+                                    'contamination': [contamination_rate, 'auto'], 'max_features': [0.7, 0.9, 1.0]}},
+    "Elliptic Envelope": {"estimator": EllipticEnvelope(random_state=42), "params": {
+        'contamination': [max(0.01, contamination_rate - 0.04), contamination_rate,
+                          min(0.49, contamination_rate + 0.04)], 'support_fraction': [None, 0.7, 0.9]}},
+    "LOF": {"estimator": LocalOutlierFactor(novelty=True),
+            "params": {'n_neighbors': [10, 20, 30, 50], 'leaf_size': [15, 30, 45], 'p': [1, 2],
+                       'contamination': [contamination_rate]}},
+    "One-Class SVM": {"estimator": OneClassSVM(), "params": {
+        'nu': [max(0.01, contamination_rate / 2), contamination_rate, min(0.49, contamination_rate * 2), 0.1, 0.2],
+        'kernel': ['rbf', 'poly', 'sigmoid'], 'gamma': ['scale', 'auto', 0.01, 0.1], 'degree': [2, 3]}}
+}
+
+
+def f1_scorer_cv(y_true_cv, y_pred_cv): return f1_score(y_true_cv, y_pred_cv, zero_division=0)
+
+
+custom_scorer = make_scorer(f1_scorer_cv)
+n_splits_stacking = 5
+kf_stack = KFold(n_splits=n_splits_stacking, shuffle=True, random_state=123)
+oof_meta_features_train_sklearn = np.zeros((len(X_train_orig_scaled), len(sklearn_models_to_tune)))
+test_meta_features_sklearn_folds = np.zeros((len(X_test_orig_scaled), len(sklearn_models_to_tune), n_splits_stacking))
+sklearn_model_names_list = list(sklearn_models_to_tune.keys())
+
+for model_idx, (model_name, model_config) in enumerate(sklearn_models_to_tune.items()):
+    base_estimator = model_config['estimator'];
+    param_dist = model_config['params']
+    if 'contamination' not in param_dist and hasattr(base_estimator,
+                                                     'contamination') and model_name == "LOF": base_estimator.set_params(
+        contamination=contamination_rate)
+    model_train_times_oof = []
+    for fold_idx, (train_fold_idx, val_fold_idx) in enumerate(kf_stack.split(X_train_orig_scaled, y_train)):
+        X_t_fold, X_v_fold = X_train_orig_scaled[train_fold_idx], X_train_orig_scaled[val_fold_idx]
+        y_t_fold_labels = y_train[train_fold_idx];
+        X_train_for_tuner_fit = X_t_fold
+        if model_name in ["Elliptic Envelope", "One-Class SVM"]:
+            X_normal_fold_tuner = X_t_fold[y_t_fold_labels == 0]
+            if len(X_normal_fold_tuner) > (X_t_fold.shape[1] if X_t_fold.ndim > 1 else 1) and len(
+                    X_normal_fold_tuner) > 0: X_train_for_tuner_fit = X_normal_fold_tuner
+        if X_train_for_tuner_fit.shape[0] == 0:
+            oof_meta_features_train_sklearn[val_fold_idx, model_idx] = np.nan;
+            test_meta_features_sklearn_folds[:, model_idx, fold_idx] = np.nan;
+            continue
+        start_time_fold_tune = time.time()
+        cv_fold = max(2, min(CV_SKLEARN, 3 if X_train_for_tuner_fit.shape[0] >= 10 else 2))
+        random_search_fold = RandomizedSearchCV(estimator=base_estimator, param_distributions=param_dist,
+                                                n_iter=max(1, N_ITER_RANDOM_SEARCH_SKLEARN // 2), cv=cv_fold,
+                                                scoring=custom_scorer, n_jobs=-1, verbose=0, random_state=42 + fold_idx)
+        try:
+            random_search_fold.fit(X_train_for_tuner_fit, y_train[train_fold_idx])
+            best_model_fold = random_search_fold.best_estimator_
+            model_train_times_oof.append(time.time() - start_time_fold_tune)
+            if hasattr(best_model_fold, "decision_function"):
+                oof_meta_features_train_sklearn[val_fold_idx, model_idx] = -best_model_fold.decision_function(X_v_fold)
+                test_meta_features_sklearn_folds[:, model_idx, fold_idx] = -best_model_fold.decision_function(
+                    X_test_orig_scaled)
+            elif hasattr(best_model_fold, "score_samples"):
+                oof_meta_features_train_sklearn[val_fold_idx, model_idx] = -best_model_fold.score_samples(X_v_fold)
+                test_meta_features_sklearn_folds[:, model_idx, fold_idx] = -best_model_fold.score_samples(
+                    X_test_orig_scaled)
+            else:
+                oof_meta_features_train_sklearn[val_fold_idx, model_idx] = np.nan;
+                test_meta_features_sklearn_folds[:,
+                model_idx, fold_idx] = np.nan
+        except ValueError as e:
+            oof_meta_features_train_sklearn[
+                val_fold_idx, model_idx] = np.nan;
+            test_meta_features_sklearn_folds[:, model_idx, fold_idx] = np.nan
+    avg_oof_fold_train_time = np.mean(model_train_times_oof) if model_train_times_oof else 0
+    X_train_for_main_tuner_fit, y_train_for_main_tuner_fit = X_train_orig_scaled, y_train
+    if model_name in ["Elliptic Envelope", "One-Class SVM"]:
+        X_normal_main = X_train_orig_scaled[y_train == 0]
+        if len(X_normal_main) > (X_train_orig_scaled.shape[1] if X_train_orig_scaled.ndim > 1 else 1) and len(
+                X_normal_main) > 0: X_train_for_main_tuner_fit, y_train_for_main_tuner_fit = X_normal_main, y_train[
+            y_train == 0]
+    if X_train_for_main_tuner_fit.shape[0] == 0:
+        results_summary[model_name] = {"precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan,
+                                       "pr_auc": np.nan, "mcc": np.nan, "train_time": np.nan, "predict_time": np.nan,
+                                       "threshold": np.nan, "train_f1_with_opt_thresh": np.nan, "best_params": {}}
+        all_scores_train[model_name] = np.full(len(X_train_orig_scaled), np.nan);
+        all_scores_test[model_name] = np.full(len(X_test_orig_scaled), np.nan);
+        continue
+
+    main_model_tune_start_time = time.time()
+    cv_main = max(2, CV_SKLEARN if X_train_for_main_tuner_fit.shape[0] >= (CV_SKLEARN * 2) else 2)
+    random_search_main = RandomizedSearchCV(estimator=base_estimator, param_distributions=param_dist,
+                                            n_iter=N_ITER_RANDOM_SEARCH_SKLEARN, cv=cv_main, scoring=custom_scorer,
+                                            n_jobs=-1, verbose=0, random_state=42)
+    try:
+        random_search_main.fit(X_train_for_main_tuner_fit, y_train_for_main_tuner_fit)
+        main_model_tuned = random_search_main.best_estimator_;
+        best_params_main = random_search_main.best_params_
+
+        main_model_train_time = (time.time() - main_model_tune_start_time) + avg_oof_fold_train_time
+        main_model_predict_start_time = time.time()
+        train_scores_model_temp, test_scores_model_temp = np.full(len(X_train_orig_scaled), np.nan), np.full(
+            len(X_test_orig_scaled), np.nan)
+        if hasattr(main_model_tuned, "decision_function"):
+            train_scores_model_temp = -main_model_tuned.decision_function(X_train_orig_scaled)
+            test_scores_model_temp = -main_model_tuned.decision_function(X_test_orig_scaled)
+        elif hasattr(main_model_tuned, "score_samples"):
+            train_scores_model_temp = -main_model_tuned.score_samples(X_train_orig_scaled)
+            test_scores_model_temp = -main_model_tuned.score_samples(X_test_orig_scaled)
+        all_scores_train[model_name] = train_scores_model_temp;
+        all_scores_test[model_name] = test_scores_model_temp
+        main_model_predict_time = time.time() - main_model_predict_start_time
+        best_threshold_sklearn_train = None;
+        best_f1_on_train_for_sklearn = 0.0
+        valid_train_indices_thresh = ~np.isnan(train_scores_model_temp)
+        scores_to_eval_th_train, y_train_to_eval_th = train_scores_model_temp[valid_train_indices_thresh], y_train[
+            valid_train_indices_thresh]
+        if len(scores_to_eval_th_train) > 0:
+            unique_train_scores = np.unique(np.sort(scores_to_eval_th_train));
+            temp_thresholds_sklearn = unique_train_scores
+            if len(unique_train_scores) > 100: temp_thresholds_sklearn = np.unique(
+                np.percentile(unique_train_scores, np.linspace(0, 100, 100)))
+            if len(temp_thresholds_sklearn) == 0: temp_thresholds_sklearn = np.array(
+                [np.median(scores_to_eval_th_train) if len(scores_to_eval_th_train) > 0 else 0.0])
+            current_best_f1_sklearn_train_val = -1.0;
+            current_best_th_sklearn = temp_thresholds_sklearn[0] if len(temp_thresholds_sklearn) > 0 else 0.0
+            for th_sklearn in temp_thresholds_sklearn:
+                f1_val_sklearn = f1_score(y_train_to_eval_th, (scores_to_eval_th_train > th_sklearn).astype(int),
+                                          zero_division=0)
+                if f1_val_sklearn > current_best_f1_sklearn_train_val: current_best_f1_sklearn_train_val = f1_val_sklearn; current_best_th_sklearn = th_sklearn
+            best_threshold_sklearn_train = current_best_th_sklearn;
+            best_f1_on_train_for_sklearn = current_best_f1_sklearn_train_val
+        else:
+            best_threshold_sklearn_train = 0.0
+        y_pred_model_test = np.full(len(y_test), 0);
+        final_y_test_for_metric = y_test;
+        final_y_pred_model_for_metric = y_pred_model_test
+        if test_scores_model_temp is not None and not np.all(np.isnan(test_scores_model_temp)):
+            if best_threshold_sklearn_train is not None and not np.isnan(best_threshold_sklearn_train):
+                y_pred_model_test = (test_scores_model_temp > best_threshold_sklearn_train).astype(int)
+            else:
+                valid_test_scores_fallback = test_scores_model_temp[~np.isnan(test_scores_model_temp)]
+                if len(valid_test_scores_fallback) > 0:
+                    fallback_threshold_test = np.percentile(valid_test_scores_fallback,
+                                                            100 - (contamination_rate * 100))
+                    y_pred_model_test = (test_scores_model_temp > fallback_threshold_test).astype(int)
+                    if best_threshold_sklearn_train is None or np.isnan(
+                            best_threshold_sklearn_train): best_threshold_sklearn_train = fallback_threshold_test
+            valid_test_indices_for_pred = ~np.isnan(test_scores_model_temp);
+            final_y_test_for_metric = y_test[valid_test_indices_for_pred];
+            final_y_pred_model_for_metric = y_pred_model_test[valid_test_indices_for_pred]
+        all_predictions_test[model_name] = y_pred_model_test
+        m_precision, m_recall, m_f1, m_roc_auc, m_pr_auc, m_mcc = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+        if len(final_y_test_for_metric) > 0 and len(final_y_pred_model_for_metric) == len(final_y_test_for_metric):
+            m_precision = precision_score(final_y_test_for_metric, final_y_pred_model_for_metric, zero_division=0)
+            m_recall = recall_score(final_y_test_for_metric, final_y_pred_model_for_metric, zero_division=0)
+            m_f1 = f1_score(final_y_test_for_metric, final_y_pred_model_for_metric, zero_division=0)
+            m_mcc = matthews_corrcoef(final_y_test_for_metric, final_y_pred_model_for_metric)
+            if len(np.unique(final_y_test_for_metric)) > 1 and not np.all(
+                    np.isnan(test_scores_model_temp[valid_test_indices_for_pred])):
+                m_roc_auc = roc_auc_score(final_y_test_for_metric, test_scores_model_temp[valid_test_indices_for_pred])
+                m_pr_auc = average_precision_score(final_y_test_for_metric,
+                                                   test_scores_model_temp[valid_test_indices_for_pred])
+
+        print(
+            f"{model_name} Results: BestTrainTh={(best_threshold_sklearn_train if best_threshold_sklearn_train is not None else np.nan):.4f}, Test P={m_precision:.4f}, R={m_recall:.4f}, F1={m_f1:.4f}, ROC-AUC={m_roc_auc:.4f}, PR-AUC={m_pr_auc:.4f}, MCC={m_mcc:.4f}, TrainT={main_model_train_time:.4f}s, PredT={main_model_predict_time:.4f}s")
+        results_summary[model_name] = {"precision": m_precision, "recall": m_recall, "f1": m_f1, "roc_auc": m_roc_auc,
+                                       "pr_auc": m_pr_auc, "mcc": m_mcc, "train_time": main_model_train_time,
+                                       "predict_time": main_model_predict_time,
+                                       "threshold": best_threshold_sklearn_train,
+                                       "train_f1_with_opt_thresh": best_f1_on_train_for_sklearn,
+                                       "best_params": best_params_main}
+    except ValueError as e:
+        results_summary[model_name] = {"precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan,
+                                       "pr_auc": np.nan, "mcc": np.nan, "train_time": np.nan, "predict_time": np.nan,
+                                       "threshold": np.nan, "train_f1_with_opt_thresh": np.nan, "best_params": {}}
+        all_scores_train[model_name] = np.full(len(X_train_orig_scaled), np.nan);
+        all_scores_test[model_name] = np.full(len(X_test_orig_scaled), np.nan)
+test_meta_features_sklearn = np.nanmean(test_meta_features_sklearn_folds, axis=2)
+
+models_for_ensemble = [];
+model_train_f1_scores = {};
+model_test_f1_scores_for_weighting = {}
+for model_name, res_val in results_summary.items():
+    test_f1 = res_val.get('f1');
+    train_f1_opt = res_val.get('train_f1_with_opt_thresh')
+    if test_f1 is not np.nan and test_f1 >= MIN_F1_FOR_ENSEMBLE_INCLUSION:
+        models_for_ensemble.append(model_name);
+        model_test_f1_scores_for_weighting[model_name] = test_f1
+        model_train_f1_scores[model_name] = train_f1_opt if train_f1_opt is not np.nan else 0.0
+
+
+valid_predictions_for_mv = [];
+mv_base_models_names = []
+for name in models_for_ensemble:
+    if name in all_predictions_test and all_predictions_test[name] is not None and not np.all(
+            np.isnan(all_predictions_test[name])):
+        valid_predictions_for_mv.append(all_predictions_test[name]);
+        mv_base_models_names.append(name)
+
+valid_scores_test_dict = {};
+norm_scaled_scores_test_dict = {}
+for name in models_for_ensemble:
+    raw_scores = all_scores_test.get(name)
+    if raw_scores is not None and not np.all(np.isnan(raw_scores)):
+        valid_scores_test_dict[name] = raw_scores;
+        valid_idx_scale = ~np.isnan(raw_scores)
+        if np.sum(valid_idx_scale) > 1:
+            unique_valid_scores = np.unique(raw_scores[valid_idx_scale])
+            if len(unique_valid_scores) > 1:
+                scaled_valid_scores = MinMaxScaler().fit_transform(raw_scores[valid_idx_scale].reshape(-1, 1)).flatten()
+            else:
+                scaled_valid_scores = np.full(np.sum(valid_idx_scale), 0.5)
+            temp_scaled_scores = np.full_like(raw_scores, np.nan);
+            temp_scaled_scores[valid_idx_scale] = scaled_valid_scores;
+            norm_scaled_scores_test_dict[name] = temp_scaled_scores
+        elif np.sum(valid_idx_scale) == 1:
+            temp_scaled_scores = np.full_like(raw_scores, np.nan);
+            temp_scaled_scores[valid_idx_scale] = 0.5;
+            norm_scaled_scores_test_dict[name] = temp_scaled_scores
+
+ENSEMBLE_BALANCE_PRIORITY = 'recall_focused_f1'
+
+if len(valid_predictions_for_mv) > 0:
+    votes = np.sum(np.array(valid_predictions_for_mv), axis=0);
+    num_models_mv = len(valid_predictions_for_mv)
+    mv_pred = (votes > num_models_mv / 2).astype(int)
+    mv_p, mv_r, mv_f1 = precision_score(y_test, mv_pred, zero_division=0), recall_score(y_test, mv_pred,
+                                                                                        zero_division=0), f1_score(
+        y_test, mv_pred, zero_division=0)
+    mv_mcc = matthews_corrcoef(y_test, mv_pred)
+    mv_tt = sum(results_summary.get(n, {}).get('train_time', 0) for n in mv_base_models_names if
+                results_summary.get(n, {}).get('train_time') is not np.nan)
+    mv_pt = sum(results_summary.get(n, {}).get('predict_time', 0) for n in mv_base_models_names if
+                results_summary.get(n, {}).get('predict_time') is not np.nan)
+    ensemble_name_mv = f"Majority Voting ({len(mv_base_models_names)})"
+    print(f"{ensemble_name_mv}: P={mv_p:.4f}, R={mv_r:.4f}, F1={mv_f1:.4f}, MCC={mv_mcc:.4f}")
+    results_summary[ensemble_name_mv] = {"precision": mv_p, "recall": mv_r, "f1": mv_f1, "roc_auc": np.nan,
+                                         "pr_auc": np.nan, "mcc": mv_mcc, "train_time": mv_tt, "predict_time": mv_pt,
+                                         "threshold": 0.5}
+
+current_scaled_scores_list = [norm_scaled_scores_test_dict[name] for name in models_for_ensemble if
+                              name in norm_scaled_scores_test_dict]
+current_raw_scores_list = [valid_scores_test_dict[name] for name in models_for_ensemble if
+                           name in valid_scores_test_dict]
+model_names_for_score_ensembles = [name for name in models_for_ensemble if name in norm_scaled_scores_test_dict]
+
+if current_scaled_scores_list and model_names_for_score_ensembles:
+    simple_avg_scores = np.nanmean(np.array(current_scaled_scores_list), axis=0)
+    if simple_avg_scores.size > 0 and not np.all(np.isnan(simple_avg_scores)):
+        ens_name_sa = f"Simple Avg SCALED ({len(model_names_for_score_ensembles)})"
+        evaluate_score_ensemble(simple_avg_scores, y_test, ens_name_sa, results_summary, ENSEMBLE_BALANCE_PRIORITY)
+        all_scores_test[ens_name_sa] = simple_avg_scores
+        if ens_name_sa in results_summary:
+            results_summary[ens_name_sa]["train_time"] = sum(
+                results_summary.get(n, {}).get('train_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('train_time') is not np.nan)
+            results_summary[ens_name_sa]["predict_time"] = sum(
+                results_summary.get(n, {}).get('predict_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('predict_time') is not np.nan)
+
+if model_names_for_score_ensembles:
+    weights_w_avg = [model_train_f1_scores.get(name, 0.0) ** 2 + 0.01 for name in model_names_for_score_ensembles]
+    if current_scaled_scores_list and sum(weights_w_avg) > 0:
+        final_scores_w, final_weights_w, final_names_w = [], [], []
+        for i, name_w in enumerate(model_names_for_score_ensembles):
+            if not np.all(np.isnan(current_scaled_scores_list[i])): final_scores_w.append(
+                current_scaled_scores_list[i]); final_weights_w.append(weights_w_avg[i]); final_names_w.append(name_w)
+        if final_scores_w:
+            try:
+                weighted_avg_scores = np.ma.average(np.ma.masked_invalid(np.array(final_scores_w)), axis=0,
+                                                    weights=np.array(final_weights_w)).filled(np.nan)
+            except ZeroDivisionError:
+                weighted_avg_scores = np.nanmean(np.array(final_scores_w), axis=0) if final_scores_w else np.array([])
+            if weighted_avg_scores.size > 0 and not np.all(np.isnan(weighted_avg_scores)):
+                ens_name_wa = f"Weighted Avg SCALED ({len(final_names_w)})"
+                evaluate_score_ensemble(weighted_avg_scores, y_test, ens_name_wa, results_summary,
+                                        ENSEMBLE_BALANCE_PRIORITY)
+                all_scores_test[ens_name_wa] = weighted_avg_scores
+                if ens_name_wa in results_summary:
+                    results_summary[ens_name_wa]["train_time"] = sum(
+                        results_summary.get(n, {}).get('train_time', 0) for n in final_names_w if
+                        results_summary.get(n, {}).get('train_time') is not np.nan)
+                    results_summary[ens_name_wa]["predict_time"] = sum(
+                        results_summary.get(n, {}).get('predict_time', 0) for n in final_names_w if
+                        results_summary.get(n, {}).get('predict_time') is not np.nan)
+
+if current_raw_scores_list and model_names_for_score_ensembles and len(current_raw_scores_list) == len(
+        model_names_for_score_ensembles):
+    ranks_list, valid_names_rank = [], []
+    for i, scores_arr in enumerate(current_raw_scores_list):
+        if scores_arr is not None and not np.all(np.isnan(scores_arr)):
+            temp_ranks = np.full_like(scores_arr, np.nan);
+            valid_idx = ~np.isnan(scores_arr)
+            if np.sum(valid_idx) > 0: temp_ranks[valid_idx] = rankdata(scores_arr[valid_idx],
+                                                                       method='average'); ranks_list.append(
+                temp_ranks); valid_names_rank.append(model_names_for_score_ensembles[i])
+    if ranks_list:
+        avg_ranks = np.nanmean(np.array(ranks_list), axis=0)
+        if avg_ranks.size > 0 and not np.all(np.isnan(avg_ranks)):
+            ens_name_ra = f"Rank Avg RAW ({len(valid_names_rank)})"
+            evaluate_score_ensemble(avg_ranks, y_test, ens_name_ra, results_summary, ENSEMBLE_BALANCE_PRIORITY)
+            all_scores_test[ens_name_ra] = avg_ranks
+            if ens_name_ra in results_summary:
+                results_summary[ens_name_ra]["train_time"] = sum(
+                    results_summary.get(n, {}).get('train_time', 0) for n in valid_names_rank if
+                    results_summary.get(n, {}).get('train_time') is not np.nan)
+                results_summary[ens_name_ra]["predict_time"] = sum(
+                    results_summary.get(n, {}).get('predict_time', 0) for n in valid_names_rank if
+                    results_summary.get(n, {}).get('predict_time') is not np.nan)
+
+if current_scaled_scores_list and model_names_for_score_ensembles:
+    max_scores = np.nanmax(np.array(current_scaled_scores_list), axis=0)
+    if max_scores.size > 0 and not np.all(np.isnan(max_scores)):
+        ens_name_max = f"Max SCALED ({len(model_names_for_score_ensembles)})"
+        evaluate_score_ensemble(max_scores, y_test, ens_name_max, results_summary, ENSEMBLE_BALANCE_PRIORITY)
+        all_scores_test[ens_name_max] = max_scores
+        if ens_name_max in results_summary:
+            results_summary[ens_name_max]["train_time"] = sum(
+                results_summary.get(n, {}).get('train_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('train_time') is not np.nan)
+            results_summary[ens_name_max]["predict_time"] = sum(
+                results_summary.get(n, {}).get('predict_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('predict_time') is not np.nan)
+
+if current_scaled_scores_list and model_names_for_score_ensembles:
+    median_scores = np.nanmedian(np.array(current_scaled_scores_list), axis=0)
+    if median_scores.size > 0 and not np.all(np.isnan(median_scores)):
+        ens_name_median = f"Median SCALED ({len(model_names_for_score_ensembles)})"
+        evaluate_score_ensemble(median_scores, y_test, ens_name_median, results_summary, ENSEMBLE_BALANCE_PRIORITY)
+        all_scores_test[ens_name_median] = median_scores
+        if ens_name_median in results_summary:
+            results_summary[ens_name_median]["train_time"] = sum(
+                results_summary.get(n, {}).get('train_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('train_time') is not np.nan)
+            results_summary[ens_name_median]["predict_time"] = sum(
+                results_summary.get(n, {}).get('predict_time', 0) for n in model_names_for_score_ensembles if
+                results_summary.get(n, {}).get('predict_time') is not np.nan)
+
+meta_features_train_list_stack = [];
+meta_features_test_list_stack = [];
+stacking_base_model_names_selected_stack = []
+for model_name_stack_feat in models_for_ensemble:
+    if model_name_stack_feat in ['Autoencoder', 'VAE']:
+        if model_name_stack_feat in all_scores_train and all_scores_train[
+            model_name_stack_feat] is not None and model_name_stack_feat in all_scores_test and all_scores_test[
+            model_name_stack_feat] is not None and not np.all(
+            np.isnan(all_scores_train[model_name_stack_feat])) and not np.all(
+            np.isnan(all_scores_test[model_name_stack_feat])):
+            meta_features_train_list_stack.append(all_scores_train[model_name_stack_feat]);
+            meta_features_test_list_stack.append(all_scores_test[model_name_stack_feat]);
+            stacking_base_model_names_selected_stack.append(model_name_stack_feat)
+    elif model_name_stack_feat in sklearn_model_names_list:
+        model_idx_s_stack = sklearn_model_names_list.index(model_name_stack_feat)
+        if model_idx_s_stack < oof_meta_features_train_sklearn.shape[1] and model_idx_s_stack < \
+                test_meta_features_sklearn.shape[1] and not np.all(
+            np.isnan(oof_meta_features_train_sklearn[:, model_idx_s_stack])) and not np.all(
+            np.isnan(test_meta_features_sklearn[:, model_idx_s_stack])):
+            meta_features_train_list_stack.append(oof_meta_features_train_sklearn[:, model_idx_s_stack]);
+            meta_features_test_list_stack.append(test_meta_features_sklearn[:, model_idx_s_stack]);
+            stacking_base_model_names_selected_stack.append(model_name_stack_feat)
+        elif model_name_stack_feat in all_scores_train and all_scores_train[
+            model_name_stack_feat] is not None and model_name_stack_feat in all_scores_test and all_scores_test[
+            model_name_stack_feat] is not None:
+            meta_features_train_list_stack.append(all_scores_train[model_name_stack_feat]);
+            meta_features_test_list_stack.append(all_scores_test[model_name_stack_feat]);
+            stacking_base_model_names_selected_stack.append(model_name_stack_feat)
+
+final_stacking_base_names_actually_used_stack = []
+if meta_features_train_list_stack and meta_features_test_list_stack and len(meta_features_train_list_stack) == len(
+        meta_features_test_list_stack) and len(meta_features_train_list_stack) > 0:
+    meta_features_train_raw_stack = np.array(meta_features_train_list_stack).T;
+    meta_features_test_raw_stack = np.array(meta_features_test_list_stack).T
+    col_means_train_meta_stack = np.nanmean(meta_features_train_raw_stack, axis=0)
+    if len(col_means_train_meta_stack) != meta_features_train_raw_stack.shape[1]: col_means_train_meta_stack = np.zeros(
+        meta_features_train_raw_stack.shape[1])
+    meta_features_train_imputed_stack = np.where(np.isnan(meta_features_train_raw_stack),
+                                                 np.tile(col_means_train_meta_stack,
+                                                         (meta_features_train_raw_stack.shape[0], 1)),
+                                                 meta_features_train_raw_stack)
+    meta_features_test_imputed_stack = np.where(np.isnan(meta_features_test_raw_stack),
+                                                np.tile(col_means_train_meta_stack,
+                                                        (meta_features_test_raw_stack.shape[0], 1)),
+                                                meta_features_test_raw_stack)
+    valid_cols_train_stack = ~np.all(
+        np.isnan(meta_features_train_imputed_stack) | ~np.isfinite(meta_features_train_imputed_stack), axis=0)
+    final_stacking_base_names_actually_used_stack = [name for i, name in
+                                                     enumerate(stacking_base_model_names_selected_stack) if
+                                                     i < len(valid_cols_train_stack) and valid_cols_train_stack[i]]
+    meta_features_train_final_stack = meta_features_train_imputed_stack[:, valid_cols_train_stack];
+    meta_features_test_final_stack = meta_features_test_imputed_stack[:, valid_cols_train_stack]
+
+    if meta_features_train_final_stack.shape[1] > 0 and meta_features_test_final_stack.shape[1] > 0 and \
+            meta_features_train_final_stack.shape[0] == len(y_train) and meta_features_test_final_stack.shape[0] == len(
+        y_test) and meta_features_train_final_stack.shape[1] == meta_features_test_final_stack.shape[1]:
+        scaler_meta_stack = StandardScaler();
+        meta_features_train_scaled_np = scaler_meta_stack.fit_transform(meta_features_train_final_stack);
+        meta_features_test_scaled_np = scaler_meta_stack.transform(meta_features_test_final_stack)
+        ADD_ORIGINAL_FEATURES_TO_STACKING = True
+        meta_train_final_input = np.hstack((meta_features_train_scaled_np,
+                                            X_train_orig_scaled)) if ADD_ORIGINAL_FEATURES_TO_STACKING else meta_features_train_scaled_np
+        meta_test_final_input = np.hstack((meta_features_test_scaled_np,
+                                           X_test_orig_scaled)) if ADD_ORIGINAL_FEATURES_TO_STACKING else meta_features_test_scaled_np
+        count_neg_lgbm, count_pos_lgbm = np.sum(y_train == 0), np.sum(y_train == 1);
+        calculated_scale_pos_weight_lgbm = count_neg_lgbm / count_pos_lgbm if count_pos_lgbm > 0 else 1.0
+        lgbm_param_dist = {'n_estimators': [100, 200, 300, 400], 'learning_rate': [0.01, 0.05, 0.1],
+                           'num_leaves': [21, 31, 51, 71], 'max_depth': [5, 7, 10, -1],
+                           'min_child_samples': [15, 20, 30], 'colsample_bytree': [0.7, 0.8, 1.0],
+                           'subsample': [0.7, 0.8, 1.0], 'reg_alpha': [0, 0.01, 0.1], 'reg_lambda': [0, 0.01, 0.1]}
+        meta_learner_lgbm_base = lgb.LGBMClassifier(random_state=42, scale_pos_weight=calculated_scale_pos_weight_lgbm,
+                                                    n_jobs=-1, verbose=-1)
+        n_iter_lgbm_stack = 50;
+        cv_lgbm_stack = max(2, CV_SKLEARN if meta_train_final_input.shape[0] >= (CV_SKLEARN * 2) else 2)
+        random_search_lgbm_stack = RandomizedSearchCV(estimator=meta_learner_lgbm_base,
+                                                      param_distributions=lgbm_param_dist, n_iter=n_iter_lgbm_stack,
+                                                      cv=cv_lgbm_stack, scoring=custom_scorer, n_jobs=-1, verbose=0,
+
+                                                      random_state=42)
+        start_time_rs_train_lgbm_stack = time.time();
+        random_search_lgbm_stack.fit(meta_train_final_input, y_train);
+        train_time_rs_meta_lgbm_stack = time.time() - start_time_rs_train_lgbm_stack
+        meta_learner_lgbm = random_search_lgbm_stack.best_estimator_
+        start_time_stack_predict_lgbm = time.time();
+        stacking_pred_proba_lgbm = meta_learner_lgbm.predict_proba(meta_test_final_input)[:, 1];
+        predict_time_stack_meta_lgbm = time.time() - start_time_stack_predict_lgbm
+        ens_name_lgbm = f"Stacking (LGBM RandS {len(final_stacking_base_names_actually_used_stack)}{'+Orig' if ADD_ORIGINAL_FEATURES_TO_STACKING else ''})"
+        all_scores_test[ens_name_lgbm] = stacking_pred_proba_lgbm
+        base_model_train_time_sum = sum(
+            results_summary.get(n, {}).get('train_time', 0) for n in final_stacking_base_names_actually_used_stack if
+            results_summary.get(n, {}).get('train_time') is not np.nan and not isinstance(
+                results_summary.get(n, {}).get('train_time', 0), str))
+        base_model_predict_time_sum = sum(
+            results_summary.get(n, {}).get('predict_time', 0) for n in final_stacking_base_names_actually_used_stack if
+            results_summary.get(n, {}).get('predict_time') is not np.nan and not isinstance(
+                results_summary.get(n, {}).get('predict_time', 0), str))
+        temp_res_lgbm = {};
+        evaluate_score_ensemble(stacking_pred_proba_lgbm, y_test, ens_name_lgbm, temp_res_lgbm,
+                                ENSEMBLE_BALANCE_PRIORITY)
+        if ens_name_lgbm in temp_res_lgbm and temp_res_lgbm[ens_name_lgbm]['f1'] is not np.nan:
+            results_summary[ens_name_lgbm] = {**temp_res_lgbm[ens_name_lgbm],
+                                              "train_time": base_model_train_time_sum + train_time_rs_meta_lgbm_stack,
+                                              "predict_time": base_model_predict_time_sum + predict_time_stack_meta_lgbm}
+            all_predictions_test[ens_name_lgbm] = (
+                    stacking_pred_proba_lgbm > temp_res_lgbm[ens_name_lgbm].get('threshold', 0.5)).astype(int)
+        else:
+            results_summary[ens_name_lgbm] = {"precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan,
+                                              "pr_auc": np.nan, "mcc": np.nan,
+                                              "train_time": base_model_train_time_sum + train_time_rs_meta_lgbm_stack,
+                                              "predict_time": base_model_predict_time_sum + predict_time_stack_meta_lgbm,
+                                              "threshold": np.nan}
+        lr_param_grid = {'C': [0.01, 0.1, 1, 10, 100], 'solver': ['liblinear']}
+        meta_learner_lr_base = LogisticRegression(random_state=42, class_weight='balanced', max_iter=1000)
+        cv_lr_stack = max(2, CV_SKLEARN if meta_train_final_input.shape[0] >= (CV_SKLEARN * 2) else 2)
+        grid_search_lr_stack = GridSearchCV(estimator=meta_learner_lr_base, param_grid=lr_param_grid, cv=cv_lr_stack,
+                                            scoring=custom_scorer, n_jobs=-1, verbose=0)
+        start_time_gs_train_lr_stack = time.time();
+        grid_search_lr_stack.fit(meta_train_final_input, y_train);
+        train_time_gs_meta_lr_stack = time.time() - start_time_gs_train_lr_stack
+        meta_learner_lr = grid_search_lr_stack.best_estimator_
+        start_time_stack_predict_lr = time.time();
+        stacking_pred_proba_lr = meta_learner_lr.predict_proba(meta_test_final_input)[:, 1];
+        predict_time_stack_meta_lr = time.time() - start_time_stack_predict_lr
+        ens_name_lr = f"Stacking (LogReg Tuned, {len(final_stacking_base_names_actually_used_stack)}{'+Orig' if ADD_ORIGINAL_FEATURES_TO_STACKING else ''})"
+        all_scores_test[ens_name_lr] = stacking_pred_proba_lr
+        temp_res_lr = {};
+        evaluate_score_ensemble(stacking_pred_proba_lr, y_test, ens_name_lr, temp_res_lr, ENSEMBLE_BALANCE_PRIORITY)
+        if ens_name_lr in temp_res_lr and temp_res_lr[ens_name_lr]['f1'] is not np.nan:
+            results_summary[ens_name_lr] = {**temp_res_lr[ens_name_lr],
+                                            "train_time": base_model_train_time_sum + train_time_gs_meta_lr_stack,
+                                            "predict_time": base_model_predict_time_sum + predict_time_stack_meta_lr}
+            all_predictions_test[ens_name_lr] = (
+                    stacking_pred_proba_lr > temp_res_lr[ens_name_lr].get('threshold', 0.5)).astype(int)
+        else:
+            results_summary[ens_name_lr] = {"precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan,
+                                            "pr_auc": np.nan, "mcc": np.nan,
+                                            "train_time": base_model_train_time_sum + train_time_gs_meta_lr_stack,
+                                            "predict_time": base_model_predict_time_sum + predict_time_stack_meta_lr,
+                                            "threshold": np.nan}
+    else:
+        num_feat_fallback = len(final_stacking_base_names_actually_used_stack)
+        key_suffix_lgbm = f"LGBM RandS {num_feat_fallback}{'+Orig' if ADD_ORIGINAL_FEATURES_TO_STACKING else ''}"
+        key_suffix_lr = f"LogReg Tuned, {num_feat_fallback}{'+Orig' if ADD_ORIGINAL_FEATURES_TO_STACKING else ''}"
+        results_summary[f"Stacking ({key_suffix_lgbm})"] = {"precision": np.nan, "recall": np.nan, "f1": np.nan,
+                                                            "roc_auc": np.nan, "pr_auc": np.nan, "mcc": np.nan,
+                                                            "train_time": np.nan, "predict_time": np.nan,
+                                                            "threshold": np.nan}
+        results_summary[f"Stacking ({key_suffix_lr})"] = {"precision": np.nan, "recall": np.nan, "f1": np.nan,
+                                                          "roc_auc": np.nan, "pr_auc": np.nan, "mcc": np.nan,
+                                                          "train_time": np.nan, "predict_time": np.nan,
+                                                          "threshold": np.nan}
+        all_scores_test[f"Stacking ({key_suffix_lgbm})"] = np.full(len(X_test_orig_scaled), np.nan)
+        all_scores_test[f"Stacking ({key_suffix_lr})"] = np.full(len(X_test_orig_scaled), np.nan)
+
+print("\nFINAL RESULTS SUMMARY\n" + "=" * 30)
+summary_df = pd.DataFrame.from_dict(results_summary, orient='index')
+cols_to_ensure = ["f1", "precision", "recall", "roc_auc", "pr_auc", "mcc", "train_time", "predict_time", "threshold",
+                  "train_f1_with_opt_thresh", "best_params"]
+for col in cols_to_ensure:
+    if col not in summary_df.columns: summary_df[col] = np.nan if col != "best_params" else [{}] * len(summary_df)
+summary_df = summary_df[cols_to_ensure].copy().dropna(subset=['f1']).sort_values(by="f1", ascending=False)
+print(summary_df.to_string(max_colwidth=50))
+
+script_version_filename_safe = SCRIPT_VERSION.replace(' ', '_').replace('(', '').replace(')', '').replace('.',
+                                                                                                          '_').replace(
+    '&', 'and').replace('+', 'plus')
+
+if not summary_df.empty:
+    metrics_to_plot = ["f1", "roc_auc", "pr_auc", "mcc"]
+    for metric in metrics_to_plot:
+        plt.figure(figsize=(24, 12));
+        plot_data_metric = summary_df.dropna(subset=[metric])
+        if not plot_data_metric.empty:
+            sns.barplot(x=plot_data_metric.index, y=metric, data=plot_data_metric.reset_index(), palette="viridis")
+            plt.xticks(rotation=75, ha="right", fontsize=9);
+            plt.yticks(fontsize=10)
+            plt.title(f"{metric.upper()} Scores ({SCRIPT_VERSION})", fontsize=16);
+            plt.ylabel(f"{metric.upper()} Score", fontsize=13);
+            plt.xlabel("Method/Ensemble", fontsize=13)
+            plt.tight_layout();
+            plt.savefig(f"{metric}_scores_comparison_{script_version_filename_safe}.png");
+            plt.close()
+
+    plt.figure(figsize=(24, 16));
+
+
+    def safe_float(val):
+        return float(val) if pd.notnull(val) and not isinstance(val, (dict, list)) else np.nan
+
+
+    summary_df["train_time_numeric"] = summary_df["train_time"].apply(safe_float)
+    summary_df["predict_time_numeric"] = summary_df["predict_time"].apply(safe_float)
+    plt.subplot(2, 1, 1);
+    plot_data_train_time = summary_df.dropna(subset=['train_time_numeric'])
+    if not plot_data_train_time.empty:
+        sns.barplot(x=plot_data_train_time.index, y="train_time_numeric", data=plot_data_train_time.reset_index(),
+                    palette="mako")
+        plt.xticks(rotation=75, ha="right", fontsize=9);
+        plt.yscale('log');
+        plt.grid(axis='y', linestyle='--');
+        plt.title(f"Training Time ({SCRIPT_VERSION})", fontsize=16);
+        plt.ylabel("Sec (log)", fontsize=13)
+    else:
+        plt.title("Training Time (No data to display)")
+    plt.subplot(2, 1, 2);
+    plot_data_pred_time = summary_df.dropna(subset=['predict_time_numeric'])
+    if not plot_data_pred_time.empty:
+        sns.barplot(x=plot_data_pred_time.index, y="predict_time_numeric", data=plot_data_pred_time.reset_index(),
+                    palette="rocket")
+        plt.xticks(rotation=75, ha="right", fontsize=9);
+        plt.yscale('log');
+        plt.grid(axis='y', linestyle='--');
+        plt.title(f"Prediction Time ({SCRIPT_VERSION})", fontsize=16);
+        plt.ylabel("Sec (log)", fontsize=13);
+        plt.xlabel("Method/Ensemble", fontsize=13)
+    else:
+        plt.title("Prediction Time (No data to display)")
+    plt.tight_layout();
+    plt.savefig(f"time_comparison_{script_version_filename_safe}.png");
+    plt.close()
+
+    pca_result_for_visuals = None;
+    can_do_3d_pca = False
+    if len(X_test_orig_scaled) > 0 and X_test_orig_scaled.shape[1] > 0:
+        num_features = X_test_orig_scaled.shape[1]
+        if num_features >= 3:
+            pca_combined = PCA(n_components=3, random_state=42);
+            pca_result_for_visuals = pca_combined.fit_transform(
+                X_test_orig_scaled);
+            can_do_3d_pca = True;
+        elif num_features == 2:
+            pca_result_for_visuals = np.hstack((X_test_orig_scaled, np.zeros((X_test_orig_scaled.shape[0], 1))));
+        elif num_features == 1:
+            pca_result_for_visuals = np.hstack((X_test_orig_scaled, np.zeros((X_test_orig_scaled.shape[0], 2))));
+
+        if num_features >= 1:
+            if can_do_3d_pca:
+                fig_combined = plt.figure(figsize=(24, 8))
+                ax1_cb = fig_combined.add_subplot(131, projection='3d');
+                ax1_cb.scatter(pca_result_for_visuals[y_test == 0, 0], pca_result_for_visuals[y_test == 0, 1],
+                               pca_result_for_visuals[y_test == 0, 2], c='blue', marker='o', alpha=0.5, s=30,
+                               label='Normal (True)');
+                ax1_cb.scatter(pca_result_for_visuals[y_test == 1, 0], pca_result_for_visuals[y_test == 1, 1],
+                               pca_result_for_visuals[y_test == 1, 2], c='red', marker='x', alpha=0.9, s=70,
+                               label='Anomaly (True)');
+                ax1_cb.set_title(f'Ground Truth (3 PCA)\n({SCRIPT_VERSION})', fontsize=14);
+                ax1_cb.legend()
+                best_ens_indices = [idx for idx in summary_df.index if
+                                    "Stacking" in idx or "Avg" in idx or "Max" in idx or "Voting" in idx or "Median" in idx]
+                best_ens_viz = summary_df.loc[best_ens_indices].idxmax()['f1'] if best_ens_indices and not \
+                summary_df.loc[
+                    best_ens_indices].empty else (summary_df.index[0] if not summary_df.empty else None)
+                if best_ens_viz and best_ens_viz in all_predictions_test and all_predictions_test[
+                    best_ens_viz] is not None:
+                    ens_pred_viz = all_predictions_test[best_ens_viz];
+                    ax2_cb = fig_combined.add_subplot(132, projection='3d');
+                    ax2_cb.scatter(pca_result_for_visuals[ens_pred_viz == 0, 0],
+                                   pca_result_for_visuals[ens_pred_viz == 0, 1],
+                                   pca_result_for_visuals[ens_pred_viz == 0, 2], c='blue', marker='o', alpha=0.5, s=30,
+                                   label='Normal (Pred)');
+                    ax2_cb.scatter(pca_result_for_visuals[ens_pred_viz == 1, 0],
+                                   pca_result_for_visuals[ens_pred_viz == 1, 1],
+                                   pca_result_for_visuals[ens_pred_viz == 1, 2], c='red', marker='x', alpha=0.9, s=70,
+                                   label='Anomaly (Pred)');
+                    f1, p, r = results_summary[best_ens_viz]['f1'], results_summary[best_ens_viz]['precision'], \
+                        results_summary[best_ens_viz]['recall'];
+                    ax2_cb.set_title(f'Best Ens: {best_ens_viz.split("(")[0].strip()}\nF1:{f1:.3f},P:{p:.3f},R:{r:.3f}',
+                                     fontsize=10);
+                    ax2_cb.legend()
+                indiv_candidates_viz = [m for m in sklearn_model_names_list + ['Autoencoder', 'VAE'] if
+                                        m in summary_df.index]
+                best_indiv_viz = summary_df.loc[indiv_candidates_viz]["f1"].idxmax() if indiv_candidates_viz and not \
+                    summary_df.loc[indiv_candidates_viz].empty else None
+                if best_indiv_viz and best_indiv_viz in all_predictions_test and all_predictions_test[
+                    best_indiv_viz] is not None:
+                    ind_pred_viz = all_predictions_test[best_indiv_viz];
+                    ax3_cb = fig_combined.add_subplot(133, projection='3d');
+                    ax3_cb.scatter(pca_result_for_visuals[ind_pred_viz == 0, 0],
+                                   pca_result_for_visuals[ind_pred_viz == 0, 1],
+                                   pca_result_for_visuals[ind_pred_viz == 0, 2], c='blue', marker='o', alpha=0.5, s=30,
+                                   label='Normal (Pred)');
+                    ax3_cb.scatter(pca_result_for_visuals[ind_pred_viz == 1, 0],
+                                   pca_result_for_visuals[ind_pred_viz == 1, 1],
+                                   pca_result_for_visuals[ind_pred_viz == 1, 2], c='red', marker='x', alpha=0.9, s=70,
+                                   label='Anomaly (Pred)');
+                    f1, p, r = results_summary[best_indiv_viz]['f1'], results_summary[best_indiv_viz]['precision'], \
+                        results_summary[best_indiv_viz]['recall'];
+                    ax3_cb.set_title(
+                        f'Best Indiv: {best_indiv_viz.split("(")[0].strip()}\nF1:{f1:.3f},P:{p:.3f},R:{r:.3f}',
+                        fontsize=10);
+                    ax3_cb.legend()
+                plt.tight_layout(pad=2.0);
+                plt.savefig(f"pca_predictions_comparison_{script_version_filename_safe}.png");
+                plt.close(fig_combined)
+
+
+            if pca_result_for_visuals is not None:
+                fig_gt = plt.figure(figsize=(10, 8));
+                ax_gt = fig_gt.add_subplot(111, projection='3d');
+                ax_gt.scatter(pca_result_for_visuals[y_test == 0, 0], pca_result_for_visuals[y_test == 0, 1],
+                              pca_result_for_visuals[y_test == 0, 2], c='blue', marker='o', alpha=0.5, s=30,
+                              label='Normal (True)');
+                ax_gt.scatter(pca_result_for_visuals[y_test == 1, 0], pca_result_for_visuals[y_test == 1, 1],
+                              pca_result_for_visuals[y_test == 1, 2], c='red', marker='x', alpha=0.9, s=70,
+                              label='Anomaly (True)');
+                title_sfx_gt = "(3 PCA)" if can_do_3d_pca else f"({num_features} Orig Feat.)";
+                ax_gt.set_title(f'Ground Truth {title_sfx_gt}\n({SCRIPT_VERSION})', fontsize=14);
+                ax_gt.set_xlabel(f"PCA 1" if can_do_3d_pca else (list_of_scaled_feature_names[0].split('(')[
+                                                                     0].strip() if num_features > 0 and list_of_scaled_feature_names else "Comp 1"));
+                ax_gt.set_ylabel(f"PCA 2" if can_do_3d_pca else (
+                    list_of_scaled_feature_names[1].split('(')[0].strip() if num_features > 1 and len(
+                        list_of_scaled_feature_names) > 1 else "Comp 2"));
+                ax_gt.set_zlabel(f"PCA 3" if can_do_3d_pca else (
+                    list_of_scaled_feature_names[2].split('(')[0].strip() if num_features > 2 and len(
+                        list_of_scaled_feature_names) > 2 else "Zero/Comp 3"));
+                ax_gt.legend();
+                plt.tight_layout();
+
+                plt.close(fig_gt);
+
+                for method_name, metrics_dict in summary_df.iterrows():
+                    if method_name in all_predictions_test and all_predictions_test[method_name] is not None:
+                        preds = all_predictions_test[method_name]
+                        if len(preds) == len(y_test):
+                            fig_m = plt.figure(figsize=(10, 8));
+                            ax_m = fig_m.add_subplot(111, projection='3d');
+                            ax_m.scatter(pca_result_for_visuals[preds == 0, 0], pca_result_for_visuals[preds == 0, 1],
+                                         pca_result_for_visuals[preds == 0, 2], c='blue', marker='o', alpha=0.5, s=30,
+                                         label='Pred Normal');
+                            ax_m.scatter(pca_result_for_visuals[preds == 1, 0], pca_result_for_visuals[preds == 1, 1],
+                                         pca_result_for_visuals[preds == 1, 2], c='red', marker='x', alpha=0.9, s=70,
+                                         label='Pred Anomaly');
+                            f1, p, r = metrics_dict.get('f1', np.nan), metrics_dict.get('precision',
+                                                                                        np.nan), metrics_dict.get(
+                                'recall',
+                                np.nan);
+                            clean_name = method_name.split("(")[0].strip();
+                            title_sfx_m = "(3 PCA)" if can_do_3d_pca else f"({num_features} Orig Feat.)";
+                            ax_m.set_title(f'Pred: {clean_name} {title_sfx_m}\nF1:{f1:.3f},P:{p:.3f},R:{r:.3f}',
+                                           fontsize=11);
+                            ax_m.set_xlabel(f"PCA 1" if can_do_3d_pca else (list_of_scaled_feature_names[0].split('(')[
+                                                                                0].strip() if num_features > 0 and list_of_scaled_feature_names else "Comp 1"));
+                            ax_m.set_ylabel(f"PCA 2" if can_do_3d_pca else (
+                                list_of_scaled_feature_names[1].split('(')[0].strip() if num_features > 1 and len(
+                                    list_of_scaled_feature_names) > 1 else "Comp 2"));
+                            ax_m.set_zlabel(f"PCA 3" if can_do_3d_pca else (
+                                list_of_scaled_feature_names[2].split('(')[0].strip() if num_features > 2 and len(
+                                    list_of_scaled_feature_names) > 2 else "Zero/Comp 3"));
+                            ax_m.legend();
+                            plt.tight_layout();
+                            safe_m_name = "".join(c if c.isalnum() else "_" for c in method_name);
+
+                            plt.close(fig_m);
+
+
+    if len(X_test_orig_scaled) > 0 and X_test_orig_scaled.shape[1] > 0 and list_of_scaled_feature_names:
+        num_actual_features = X_test_orig_scaled.shape[1];
+        plot_feature_labels = [name.split('(')[0].strip().replace(" ", "\n") for name in list_of_scaled_feature_names]
+        for method_name_iter, metrics_dict_iter in summary_df.iterrows():
+            if method_name_iter in all_scores_test and all_scores_test[method_name_iter] is not None:
+                method_anomaly_scores = all_scores_test.get(method_name_iter)
+                if method_anomaly_scores is not None and len(method_anomaly_scores) == len(
+                        X_test_orig_scaled) and not np.all(np.isnan(method_anomaly_scores)):
+                    df_for_corr = pd.DataFrame(X_test_orig_scaled, columns=plot_feature_labels);
+                    df_for_corr['Anomaly\nScore'] = method_anomaly_scores;
+                    df_for_corr_cleaned = df_for_corr.dropna(subset=['Anomaly\nScore'])
+                    if df_for_corr_cleaned.shape[0] < 2 or df_for_corr_cleaned.shape[1] < 2: continue
+                    if df_for_corr_cleaned['Anomaly\nScore'].nunique() < 2: continue
+                    try:
+                        corr_matrix = df_for_corr_cleaned.corr()
+                    except Exception as e:
+                        continue
+                    fig_width = max(10, corr_matrix.shape[1] * 0.8);
+                    fig_height = max(8, corr_matrix.shape[0] * 0.7)
+                    plt.figure(figsize=(fig_width, fig_height));
+                    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5, vmin=-1, vmax=1,
+                                annot_kws={"size": 7})
+                    clean_title_method_name_iter = method_name_iter.split('(')[0].strip();
+                    plt.title(
+                        f'Correlation Matrix: Features & "{clean_title_method_name_iter}" Anomaly Score\n({SCRIPT_VERSION})',
+                        fontsize=12);
+                    plt.xticks(rotation=60, ha="right", fontsize=8);
+                    plt.yticks(rotation=0, fontsize=8);
+                    plt.tight_layout(pad=1.5)
+                    safe_method_name_iter = "".join(c if c.isalnum() else "_" for c in method_name_iter);
+                    filename_corr = f"correlation_matrix_{safe_method_name_iter}_{script_version_filename_safe}.png";
+                    plt.savefig(filename_corr);
+                    plt.close();
+print("\nCharts are saved")
